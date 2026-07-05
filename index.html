@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ubuntu@localhost: ~</title>
+<title>Shellium</title>
 
 <!-- COI service worker MUST be first script, before anything touching SharedArrayBuffer -->
 <script src="coi-serviceworker.js"></script>
@@ -16,9 +16,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.terminal/2.42.1/js/jquery.terminal.min.js"></script>
 
-<!-- Pyodide (real python3 in-browser) -->
-<script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
-
 <!-- ffmpeg.wasm (real, needs cross-origin isolation from the service worker above) -->
 <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
 
@@ -29,6 +26,7 @@
     --size:1.05;
     font-family:'Courier New', 'Cascadia Mono', monospace;
     background-color:#0c0c0c !important;
+    -webkit-tap-highlight-color: rgba(255, 255, 255, 0);
   }
   .terminal .terminal-output div div{ word-break:break-all; }
   #topbar{
@@ -37,12 +35,14 @@
     display:flex;align-items:center;gap:14px;
     font-family:'Courier New',monospace;font-size:12px;color:#ccc;
     z-index:9999;padding-left:8px;user-select:none;
+    -webkit-tap-highlight-color: rgba(255, 255, 255, 0);
   }
   #topbar .menu{position:relative;cursor:pointer;padding:3px 8px;}
   #topbar .menu:hover{background:#2d2d2d;}
   #topbar .dropdown{
     display:none;position:absolute;top:20px;left:0;background:#222;
     border:1px solid #444;min-width:170px;box-shadow:0 4px 10px rgba(0,0,0,.6);
+    -webkit-tap-highlight-color: rgba(255, 255, 255, 0);
   }
   #topbar .dropdown div{padding:6px 10px;font-size:12px;white-space:nowrap;}
   #topbar .dropdown div:hover{background:#3a3a3a;}
@@ -52,6 +52,7 @@
   .bw .terminal-output, .bw .cmd, .bw .cmd-prompt{ color:#fff !important; }
   .cursor-node{ animation: blink 1s steps(1) infinite; }
   @keyframes blink{ 50%{opacity:0;} }
+  -webkit-tap-highlight-color: rgba(255, 255, 255, 0);
 </style>
 </head>
 <body>
@@ -275,10 +276,20 @@ function ensurePyodide(term){
   if(pyodideInstance) return Promise.resolve(pyodideInstance);
   if(pyodidePromise) return pyodidePromise;
   term.echo('Loading Python 3 runtime (pyodide, real wasm build)...');
-  pyodidePromise = loadPyodide({ indexURL: PYODIDE_INDEX_URL }).then(py=>{
+  pyodidePromise = (async ()=>{
+    // Dynamic ESM import of pyodide.mjs — matches the approach used by
+    // Pyodide's own official in-browser console. The classic <script src=
+    // "pyodide.js"> global-loader path conflicts with the coi-serviceworker's
+    // fetch interception and throws DataCloneError during worker setup.
+    const { loadPyodide } = await import(PYODIDE_INDEX_URL + 'pyodide.mjs');
+    const py = await loadPyodide();
+    // print()/stdout and tracebacks/stderr default to console.log in pyodide —
+    // pipe both into the visible terminal instead.
+    py.setStdout({ batched: (s)=>{ if(s!=='') term.echo(s); } });
+    py.setStderr({ batched: (s)=>{ if(s!=='') term.echo(s); } });
     pyodideInstance = py;
     return py;
-  }).catch(err=>{
+  })().catch(err=>{
     pyodidePromise = null;
     throw err;
   });
