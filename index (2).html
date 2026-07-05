@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ubuntu@localhost: ~</title>
+
+<!-- COI service worker MUST be first script, before anything touching SharedArrayBuffer -->
+<script src="coi-serviceworker.js"></script>
+
+<!-- Best-effort CSP via meta (COOP/COEP can't be set via meta, that's what the service worker above is for) -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; worker-src 'self' blob: https:; connect-src 'self' https: blob: data:; img-src 'self' data: blob: https:;">
+
+<!-- jQuery + jQuery Terminal (real cdnjs links) -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.terminal/2.42.1/css/jquery.terminal.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.terminal/2.42.1/js/jquery.terminal.min.js"></script>
+
+<!-- Pyodide (real python3 in-browser) -->
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
+
+<!-- ffmpeg.wasm (real, needs cross-origin isolation from the service worker above) -->
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden;}
+  #term{width:100%;height:100vh;}
+  .terminal{
+    --size:1.05;
+    font-family:'Courier New', 'Cascadia Mono', monospace;
+    background-color:#0c0c0c !important;
+  }
+  .terminal .terminal-output div div{ word-break:break-all; }
+  #topbar{
+    position:fixed;top:0;left:0;right:0;height:26px;
+    background:#1a1a1a;border-bottom:1px solid #333;
+    display:flex;align-items:center;gap:14px;
+    font-family:'Courier New',monospace;font-size:12px;color:#ccc;
+    z-index:9999;padding-left:8px;user-select:none;
+  }
+  #topbar .menu{position:relative;cursor:pointer;padding:3px 8px;}
+  #topbar .menu:hover{background:#2d2d2d;}
+  #topbar .dropdown{
+    display:none;position:absolute;top:20px;left:0;background:#222;
+    border:1px solid #444;min-width:170px;box-shadow:0 4px 10px rgba(0,0,0,.6);
+  }
+  #topbar .dropdown div{padding:6px 10px;font-size:12px;white-space:nowrap;}
+  #topbar .dropdown div:hover{background:#3a3a3a;}
+  #topbar .menu:hover .dropdown{display:block;}
+  #term{margin-top:26px;height:calc(100vh - 26px);}
+  .bw .terminal{ background-color:#000 !important; color:#fff !important; }
+  .bw .terminal-output, .bw .cmd, .bw .cmd-prompt{ color:#fff !important; }
+  .cursor-node{ animation: blink 1s steps(1) infinite; }
+  @keyframes blink{ 50%{opacity:0;} }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="menu">Options
+    <div class="dropdown">
+      <div id="opt-color">Color scheme: Color</div>
+      <div id="opt-clear">Clear screen</div>
+      <div id="opt-reset">Reset filesystem</div>
+    </div>
+  </div>
+  <div class="menu">About
+    <div class="dropdown">
+      <div id="about-info">webshell v1.0 — browser terminal emulator</div>
+    </div>
+  </div>
+</div>
+
+<div id="term"></div>
+
+<script>
+(function(){
+
+/* ============================================================
+   VIRTUAL FILESYSTEM
+   persisted to localStorage, "session" flagged via a cookie
+   ============================================================ */
+const FS_KEY = 'webshell_fs_v1';
+const BLOB_STORE = {}; // path -> Blob (real uploaded/generated binary data, not persisted across reload)
+
+function defaultFS(){
+  const dir = (contents) => ({type:'d', mode:'drwxr-xr-x', contents});
+  const bin = (size) => ({type:'f', mode:'-rwxr-xr-x', size: size||0, data:''});
+  const chr = () => ({type:'c', mode:'crw-rw----', size:0, data:''});
+
+  const binaries = ['sudo','ls','cd','mkdir','cp','rm','nano','apt','apt-get','uname','curl','ssh',
+    'telnet','su','python','python3','python2','python2.7','pip','pip3','ffmpeg','ul','dl','login',
+    'logout','whoami','pwd','echo','cat','touch','stat','mount','df','free','ps','top','history',
+    'clear','man','date','uptime','hostname','chmod','chown','grep','head','tail','wc','which',
+    'env','export','kill','uptime','nmap','vnc','vncviewer','wget','tar','gzip','gunzip','find',
+    'df','du','id','groups','passwd','ln','touch','less','more','vi','vim'];
+
+  const binDir = {};
+  binaries.forEach(b=>binDir[b]=bin(Math.floor(Math.random()*40000)+8000));
+
+  return dir({
+    bin: dir(Object.assign({}, binDir)),
+    sbin: dir({shutdown:bin(15000), reboot:bin(15000), init:bin(90000)}),
+    dev: dir({
+      bus: dir({usb:dir({})}),
+      input: dir({event0:chr(), event1:chr(), mice:chr()}),
+      snd: dir({pcmC0D0p:chr(), controlC0:chr()}),
+      net: dir({tun:chr()}),
+      logdir: dir({}),
+      pts: dir({'0':chr()}),
+      shm: dir({}),
+      mapper: dir({}),
+      sda1: chr(),
+      sdb2: chr(),
+      null: chr(),
+      power: dir({state:bin(0)}),
+    }),
+    etc: dir({
+      hostname: {type:'f',mode:'-rw-r--r--',size:7,data:'ubuntu\n'},
+      hosts: {type:'f',mode:'-rw-r--r--',size:23,data:'127.0.0.1 localhost\n'},
+      passwd: {type:'f',mode:'-rw-r--r--',size:0,data:'root:x:0:0:root:/root:/bin/bash\n'},
+      os_release: {type:'f',mode:'-rw-r--r--',size:0,data:'PRETTY_NAME="Ubuntu 24.04.1 LTS"\n'},
+    }),
+    home: dir({ root: dir({}) }),
+    lib: dir({ 'x86_64-linux-gnu': dir({}) }),
+    mnt: dir({}),
+    proc: dir({ cpuinfo: bin(0), meminfo: bin(0), version: bin(0) }),
+    usr: dir({
+      bin: dir(Object.assign({}, binDir)),
+      sbin: dir({useradd:bin(20000), groupadd:bin(18000)}),
+      lib: dir({}),
+      share: dir({}),
+    }),
+    var: dir({ log: dir({}), tmp: dir({}), www: dir({}) }),
+  });
+}
+
+let FS;
+try{
+  const saved = localStorage.getItem(FS_KEY);
+  FS = saved ? JSON.parse(saved) : defaultFS();
+}catch(e){ FS = defaultFS(); }
+if(!document.cookie.includes('webshell_session=')){
+  document.cookie = 'webshell_session=1; path=/; max-age=31536000';
+}
+
+function saveFS(){
+  try{ localStorage.setItem(FS_KEY, JSON.stringify(FS)); }catch(e){/* quota etc */}
+}
+
+let cwdPath = ['home','root'];
+
+function resolvePath(p){
+  // returns array of path segments, resolved (., .., absolute/relative)
+  let parts;
+  if(p===undefined || p===''){ return cwdPath.slice(); }
+  if(p.startsWith('/')){ parts = p.split('/').filter(Boolean); }
+  else { parts = cwdPath.concat(p.split('/').filter(Boolean)); }
+  const out = [];
+  for(const part of parts){
+    if(part==='.') continue;
+    if(part==='..'){ out.pop(); continue; }
+    out.push(part);
+  }
+  return out;
+}
+
+function getNode(pathArr){
+  let node = FS;
+  for(const seg of pathArr){
+    if(node.type!=='d' || !node.contents || !(seg in node.contents)) return null;
+    node = node.contents[seg];
+  }
+  return node;
+}
+
+function getParent(pathArr){
+  if(pathArr.length===0) return null;
+  const parentPath = pathArr.slice(0,-1);
+  const parent = getNode(parentPath);
+  return parent;
+}
+
+function pathStr(arr){ return '/'+arr.join('/'); }
+
+function promptPath(){
+  const full = pathStr(cwdPath);
+  if(full === pathStr(['home','root'])) return '~';
+  return full;
+}
+
+/* ============================================================
+   SESSION / USER STATE
+   ============================================================ */
+let session = {
+  user: 'root',
+  host: 'ubuntu',
+  loggedIn: true,   // starts already "in" a root shell (d mode)
+  mode: 'd',        // 'd' = default/root shell, 'l' = logged-in user shell
+};
+
+function promptString(){
+  const sym = session.user==='root' ? '#' : '$';
+  return `[[;#5fd7ff;]${session.user}@${session.host}]:[[;#87d787;]${promptPath()}]${sym} `;
+}
+
+/* ============================================================
+   TERMINAL OUTPUT HELPERS
+   ============================================================ */
+let term;
+
+function ls(term, args){
+  const showAll = args.includes('-a')||args.includes('-la')||args.includes('-al');
+  const longFmt = args.includes('-l')||args.includes('-la')||args.includes('-al');
+  const targets = args.filter(a=>!a.startsWith('-'));
+  const target = targets[0];
+  const node = getNode(resolvePath(target));
+  if(!node){ term.echo(`ls: cannot access '${target}': No such file or directory`); return; }
+  if(node.type!=='d'){ term.echo(target); return; }
+  let names = Object.keys(node.contents);
+  if(showAll) names = ['.','..'].concat(names);
+  else names = names.filter(n=>!n.startsWith('.'));
+  if(!longFmt){
+    term.echo(names.map(n=>{
+      const c = node.contents[n];
+      if(!c) return n;
+      return c.type==='d' ? `[[;#5fafff;]${n}]` : (c.mode&&c.mode.includes('x') ? `[[;#5fd75f;]${n}]` : n);
+    }).join('  '));
+  } else {
+    names.forEach(n=>{
+      const c = node.contents[n] || node;
+      const size = c.size||0;
+      const mode = c.mode || 'drwxr-xr-x';
+      term.echo(`${mode} 1 root root ${String(size).padStart(6)} Jan  1 00:00 ${n}`);
+    });
+  }
+}
+
+function unameOut(all){
+  if(!all) return 'Linux';
+  return 'Linux ubuntu 6.8.0-45-generic #45-Ubuntu SMP PREEMPT_DYNAMIC Thu Aug 8 2024 x86_64 x86_64 x86_64 GNU/Linux';
+}
+
+const WELCOME = `Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-45-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/pro
+
+Last login: ${new Date().toString()} on pts/0`;
+
+function fakeDelay(term, lines, cb, speed){
+  let i=0;
+  const step = ()=>{
+    if(i<lines.length){ term.echo(lines[i]); i++; setTimeout(step, speed||120); }
+    else if(cb) cb();
+  };
+  step();
+}
+
+/* ============================================================
+   PYODIDE (real python3) + FFMPEG (real) — lazy loaded
+   ============================================================ */
+let pyodideInstance = null;
+let pyodidePromise = null;
+let ffmpegInstance = null;
+let ffmpegLoading = false;
+
+const PYODIDE_INDEX_URL = 'https://cdn.jsdelivr.net/pyodide/v0.26.2/full/';
+
+function ensurePyodide(term){
+  // Guard against concurrent calls (e.g. onStart + first typed command)
+  // racing two separate loadPyodide() invocations, which corrupts the
+  // worker/wasm instantiation and throws DataCloneError on postMessage.
+  if(pyodideInstance) return Promise.resolve(pyodideInstance);
+  if(pyodidePromise) return pyodidePromise;
+  term.echo('Loading Python 3 runtime (pyodide, real wasm build)...');
+  pyodidePromise = loadPyodide({ indexURL: PYODIDE_INDEX_URL }).then(py=>{
+    pyodideInstance = py;
+    return py;
+  }).catch(err=>{
+    pyodidePromise = null;
+    throw err;
+  });
+  return pyodidePromise;
+}
+
+async function ensureFfmpeg(term){
+  if(ffmpegInstance) return ffmpegInstance;
+  term.echo('Loading ffmpeg.wasm core (real, requires cross-origin isolation)...');
+  if(!window.crossOriginIsolated){
+    term.echo('[[;#ff8787;]warning: crossOriginIsolated is false — SharedArrayBuffer / threads unavailable. Reload once the service worker registers.]');
+  }
+  const { createFFmpeg } = FFmpeg;
+  ffmpegInstance = createFFmpeg({
+    log:true,
+    corePath:'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+    logger: ({message})=>term.echo(message),
+  });
+  await ffmpegInstance.load();
+  return ffmpegInstance;
+}
+
+/* ============================================================
+   COMMAND TABLE
+   ============================================================ */
+function writeFileNode(pathArr, dataOrBlob, isBlob){
+  const parent = getParent(pathArr);
+  const name = pathArr[pathArr.length-1];
+  if(!parent || parent.type!=='d'){ return false; }
+  if(isBlob){
+    parent.contents[name] = {type:'f', mode:'-rw-r--r--', size:dataOrBlob.size, data:'[binary]'};
+    BLOB_STORE[pathStr(pathArr)] = dataOrBlob;
+  } else {
+    parent.contents[name] = {type:'f', mode:'-rw-r--r--', size:dataOrBlob.length, data:dataOrBlob};
+  }
+  saveFS();
+  return true;
+}
+
+function handleCommand(cmdline, term){
+  const trimmed = cmdline.trim();
+  if(trimmed==='') return;
+  const args = trimmed.split(/\s+/);
+  const cmd = args[0];
+  const rest = args.slice(1);
+
+  switch(cmd){
+
+    case 'help':
+      term.echo(`Common commands: ls cd pwd mkdir cp rm nano cat touch stat mount df free ps top
+history clear man date uptime hostname whoami echo which env chmod chown find du id groups
+Networking (mockup, always fails): ssh telnet nmap vnc wget curl
+System: sudo su apt apt-get uname login logout
+Runtimes: python python2 python2.7 python3 pip ffmpeg
+Files: ul (upload real file) dl (download real file)`);
+      break;
+
+    case 'uname':
+      term.echo(unameOut(rest.includes('-a')));
+      break;
+
+    case 'ls': case 'dir':
+      ls(term, rest);
+      break;
+
+    case 'pwd':
+      term.echo(pathStr(cwdPath));
+      break;
+
+    case 'cd': {
+      const target = rest[0]===undefined ? ['home','root'] : resolvePath(rest[0]);
+      const node = getNode(target);
+      if(!node){ term.echo(`bash: cd: ${rest[0]}: No such file or directory`); break; }
+      if(node.type!=='d'){ term.echo(`bash: cd: ${rest[0]}: Not a directory`); break; }
+      cwdPath = target;
+      break;
+    }
+
+    case 'mkdir': {
+      if(!rest[0]){ term.echo('mkdir: missing operand'); break; }
+      const target = resolvePath(rest[0]);
+      const parent = getParent(target);
+      const name = target[target.length-1];
+      if(!parent){ term.echo(`mkdir: cannot create directory '${rest[0]}': No such file or directory`); break; }
+      if(parent.contents[name]){ term.echo(`mkdir: cannot create directory '${rest[0]}': File exists`); break; }
+      parent.contents[name] = {type:'d', mode:'drwxr-xr-x', contents:{}};
+      saveFS();
+      break;
+    }
+
+    case 'touch': {
+      if(!rest[0]){ term.echo('touch: missing file operand'); break; }
+      const target = resolvePath(rest[0]);
+      const parent = getParent(target);
+      const name = target[target.length-1];
+      if(!parent){ term.echo(`touch: cannot touch '${rest[0]}': No such file or directory`); break; }
+      if(!parent.contents[name]) parent.contents[name] = {type:'f',mode:'-rw-r--r--',size:0,data:''};
+      saveFS();
+      break;
+    }
+
+    case 'cp': {
+      if(rest.length<2){ term.echo('cp: missing destination file operand'); break; }
+      const src = getNode(resolvePath(rest[0]));
+      if(!src){ term.echo(`cp: cannot stat '${rest[0]}': No such file or directory`); break; }
+      const destPath = resolvePath(rest[1]);
+      const parent = getParent(destPath);
+      if(!parent){ term.echo(`cp: cannot create '${rest[1]}'`); break; }
+      parent.contents[destPath[destPath.length-1]] = JSON.parse(JSON.stringify(src));
+      saveFS();
+      break;
+    }
+
+    case 'rm': {
+      if(rest.includes('-rf') && (rest.includes('/') ) && trimmed.includes('--no-preserve-root')){
+        term.echo(`rm: it is dangerous to operate recursively on '/'\nrm: use --no-preserve-root to override this failsafe`);
+        term.echo(`rm: cannot remove '/': Permission denied`);
+        break;
+      }
+      const fileArgs = rest.filter(a=>!a.startsWith('-'));
+      if(!fileArgs[0]){ term.echo('rm: missing operand'); break; }
+      const target = resolvePath(fileArgs[0]);
+      if(target.length===0){ term.echo(`rm: cannot remove '/': Permission denied`); break; }
+      const parent = getParent(target);
+      const name = target[target.length-1];
+      if(!parent || !parent.contents[name]){ term.echo(`rm: cannot remove '${fileArgs[0]}': No such file or directory`); break; }
+      delete parent.contents[name];
+      delete BLOB_STORE[pathStr(target)];
+      saveFS();
+      break;
+    }
+
+    case 'ln':
+      term.echo(`ln: failed to create link '${rest[rest.length-1]||''}': Permission denied`);
+      break;
+
+    case 'cat': {
+      if(!rest[0]){ term.echo('cat: missing operand'); break; }
+      const node = getNode(resolvePath(rest[0]));
+      if(!node){ term.echo(`cat: ${rest[0]}: No such file or directory`); break; }
+      if(node.type==='d'){ term.echo(`cat: ${rest[0]}: Is a directory`); break; }
+      term.echo(node.data||'');
+      break;
+    }
+
+    case 'nano': case 'vi': case 'vim': {
+      const fname = rest[0];
+      if(!fname){ term.echo(`${cmd}: file name required`); break; }
+      const target = resolvePath(fname);
+      const parent = getParent(target);
+      const name = target[target.length-1];
+      const existing = parent && parent.contents[name] ? parent.contents[name].data||'' : '';
+      openEditor(fname, existing, (content)=>{
+        writeFileNode(target, content, false);
+        term.echo(`Wrote ${content.length} bytes to ${fname}`);
+      });
+      break;
+    }
+
+    case 'stat': {
+      const node = getNode(resolvePath(rest[0]));
+      if(!node){ term.echo(`stat: cannot stat '${rest[0]}': No such file or directory`); break; }
+      term.echo(`  File: ${rest[0]}\n  Size: ${node.size||0}\tBlocks: 8\tIO Block: 4096\t${node.type==='d'?'directory':'regular file'}\nAccess: (0${node.mode&&node.mode.includes('x')?'755':'644'}/${node.mode})\tUid: (0/root)\tGid: (0/root)`);
+      break;
+    }
+
+    case 'whoami': term.echo(session.user); break;
+    case 'hostname': term.echo(session.host); break;
+    case 'id': term.echo(`uid=0(root) gid=0(root) groups=0(root)`); break;
+    case 'groups': term.echo('root'); break;
+    case 'date': term.echo(new Date().toString()); break;
+    case 'uptime': term.echo(' 00:00:01 up 4 min,  1 user,  load average: 0.08, 0.12, 0.09'); break;
+    case 'clear': term.clear(); break;
+    case 'history': term.echo(term.history().join('\n')); break;
+    case 'echo': term.echo(rest.join(' ')); break;
+    case 'env': term.echo('SHELL=/bin/bash\nHOME=/home/root\nUSER=root\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'); break;
+    case 'which': term.echo(rest[0] ? `/usr/bin/${rest[0]}` : ''); break;
+    case 'chmod': case 'chown': term.echo(''); break;
+
+    case 'df':
+      term.echo(`Filesystem     1K-blocks     Used Available Use% Mounted on
+/dev/sda1       61255492 18442112  39687168  32% /
+tmpfs             819200        0    819200   0% /dev/shm`);
+      break;
+    case 'du': term.echo('4\t.'); break;
+    case 'free':
+      term.echo(`               total        used        free      shared  buff/cache   available
+Mem:         8127364     1421080     4832216       10240      1874068     6412104
+Swap:        2097148           0     2097148`);
+      break;
+    case 'ps':
+      term.echo(`  PID TTY          TIME CMD
+    1 pts/0    00:00:00 bash
+   42 pts/0    00:00:00 ps`);
+      break;
+    case 'top':
+      term.echo(`top - load average: 0.08, 0.12, 0.09
+Tasks:   2 total,   1 running,   1 sleeping
+%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.5 id
+MiB Mem :   7936.0 total,   4720.5 free,   1387.8 used
+  PID USER      PR  NI    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+    1 root      20   0   8112   4200 S   0.0  0.1   0:00.03 bash`);
+      break;
+    case 'mount':
+      term.echo(`/dev/sda1 on / type ext4 (rw,relatime)
+tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev)`);
+      break;
+    case 'find':
+      term.echo(pathStr(cwdPath));
+      break;
+    case 'grep': case 'head': case 'tail': case 'wc': case 'less': case 'more':
+      term.echo('');
+      break;
+
+    case 'man':
+      term.echo(rest[0] ? `No manual entry for ${rest[0]}` : 'What manual page do you want?');
+      break;
+
+    /* ---------- networking: all mockup, always fail ---------- */
+    case 'ssh':
+      if(!rest[0]){ term.echo('usage: ssh [user@]hostname'); break; }
+      fakeDelay(term, [`ssh: connect to host ${rest[0].split('@').pop()} port 22: Connection refused`]);
+      break;
+    case 'telnet':
+      if(!rest[0]){ term.echo('usage: telnet host [port]'); break; }
+      fakeDelay(term, [`Trying ${rest[0]}...`, `telnet: Unable to connect to remote host: Connection refused`], null, 400);
+      break;
+    case 'nmap':
+      if(!rest[0]){ term.echo('usage: nmap [target]'); break; }
+      fakeDelay(term, [
+        `Starting Nmap 7.94 ( https://nmap.org )`,
+        `Failed to resolve "${rest[rest.length-1]}".`,
+        `WARNING: No targets were specified, or all failed to resolve.`,
+        `Nmap done: 0 IP addresses (0 hosts up) scanned`
+      ], null, 350);
+      break;
+    case 'vnc': case 'vncviewer':
+      fakeDelay(term, [`Connecting to ${rest[0]||'localhost:5900'}...`, `Unable to connect to host: Connection refused (10061)`], null, 400);
+      break;
+    case 'wget': case 'curl': {
+      const url = rest.find(a=>!a.startsWith('-'));
+      if(!url){ term.echo(`${cmd}: try '${cmd} --help' for more information`); break; }
+      term.echo(`${cmd==='curl'?'% Total    % Received % Xferd  Average Speed   Time    Time     Time  Current':'--'+new Date().toISOString()+'--  '+url}`);
+      fetch(url, {mode:'no-cors'}).then(()=>{
+        term.echo(`${cmd}: request sent (opaque response — browser sandbox hides body/status for cross-origin no-cors fetch)`);
+      }).catch(err=>{
+        term.echo(`${cmd}: (6) Could not resolve host: ${url}`);
+      });
+      break;
+    }
+
+    /* ---------- privilege / auth ---------- */
+    case 'sudo': {
+      if(rest.length===0){ term.echo('usage: sudo command'); break; }
+      term.echo(`[sudo] password for ${session.user}: `, {finalize(div){} });
+      term.read('', true, (pw)=>{
+        session.user='root';
+        handleCommand(rest.join(' '), term);
+      });
+      break;
+    }
+    case 'su': {
+      if(rest[0]==='-l' || rest[0]==='-'){
+        term.read('Password: ', true, ()=>{
+          session.user='root'; session.mode='l';
+          term.echo(WELCOME);
+        });
+      } else {
+        session.user='root';
+        term.echo('');
+      }
+      break;
+    }
+    case 'login': {
+      term.read('ubuntu login: ', false, (user)=>{
+        term.read('Password: ', true, ()=>{
+          session.user = user||'root';
+          session.loggedIn = true;
+          term.echo('');
+          term.echo(WELCOME);
+        });
+      });
+      break;
+    }
+    case 'logout': case 'exit':
+      term.clear();
+      session.loggedIn = false;
+      term.echo('logout\n');
+      fakeDelay(term, ['ubuntu login: '], ()=>{ session.loggedIn=true; }, 300);
+      break;
+
+    /* ---------- package manager (fake) ---------- */
+    case 'apt': case 'apt-get': {
+      if(rest[0]==='update'){
+        fakeDelay(term, [
+          'Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease',
+          'Hit:2 http://security.ubuntu.com/ubuntu noble-security InRelease',
+          'Reading package lists... Done',
+          'Building dependency tree... Done',
+          'All packages are up to date.'
+        ], null, 250);
+      } else if(rest[0]==='install'){
+        const pkg = rest[1]||'package';
+        fakeDelay(term, [
+          `Reading package lists... Done`,
+          `Building dependency tree... Done`,
+          `E: Unable to locate package ${pkg}`,
+        ], null, 300);
+      } else {
+        term.echo('apt: usage: apt [update|install <pkg>|upgrade|remove <pkg>]');
+      }
+      break;
+    }
+
+    /* ---------- python runtimes ---------- */
+    case 'python2': case 'python2.7': {
+      term.echo(`Python 2.7.18 (default, mock interpreter — no real 2.x runtime in-browser)`);
+      term.echo(`Type "help", "copyright", "credits" or "license" for more information.`);
+      enterPyMockRepl(term);
+      break;
+    }
+    case 'python': case 'python3': {
+      term.push(async function(cmd_line){
+        if(cmd_line.trim()==='exit()' || cmd_line.trim()==='quit()'){ this.pop(); return; }
+        try{
+          const py = await ensurePyodide(term);
+          let result = await py.runPythonAsync(cmd_line);
+          if(result!==undefined && result!==null) term.echo(String(result));
+        }catch(e){
+          term.error(String(e.message||e).split('\n').slice(-3).join('\n'));
+        }
+      }, {
+        prompt: '[[;#ff5fff;]>>> ]',
+        name:'python3-repl',
+        onStart: async function(){
+          term.echo('Python 3.11.3 (pyodide real wasm build)');
+          term.echo('Type "exit()" or "quit()" to leave.');
+          await ensurePyodide(term);
+        }
+      });
+      break;
+    }
+    case 'pip': case 'pip3': {
+      const pkg = rest[rest.length-1]||'package';
+      term.echo(`ERROR: Could not find a version that satisfies the requirement ${pkg} (from versions: none)`);
+      term.echo(`ERROR: No matching distribution found for ${pkg}`);
+      term.echo(`note: pip has no network package index available in this sandboxed shell — library not found`);
+      break;
+    }
+
+    /* ---------- ffmpeg (real) ---------- */
+    case 'ffmpeg': {
+      (async ()=>{
+        try{
+          const ff = await ensureFfmpeg(term);
+          term.echo('ffmpeg version 4.4.1 (ffmpeg.wasm core 0.11.0) Copyright (c) 2000-2021 the FFmpeg developers');
+          if(rest.length===0){ term.echo('ffmpeg: no input specified. Usage: ffmpeg -i <input-in-vfs> <output>'); return; }
+          const iIdx = rest.indexOf('-i');
+          if(iIdx===-1){ term.echo('ffmpeg: -i argument expected'); return; }
+          const inName = rest[iIdx+1];
+          const outName = rest[rest.length-1];
+          const inPath = resolvePath(inName);
+          const blob = BLOB_STORE[pathStr(inPath)];
+          if(!blob){ term.echo(`ffmpeg: ${inName}: No such file or directory (upload real binary data first with 'ul ${inName}')`); return; }
+          const buf = new Uint8Array(await blob.arrayBuffer());
+          ff.FS('writeFile', inName, buf);
+          await ff.run('-i', inName, outName);
+          const data = ff.FS('readFile', outName);
+          const outBlob = new Blob([data.buffer]);
+          const outPath = resolvePath(outName);
+          writeFileNode(outPath, outBlob, true);
+          term.echo(`Output written to ${outName} (${outBlob.size} bytes) in ${pathStr(cwdPath)}`);
+        }catch(e){
+          term.echo('ffmpeg: ' + (e.message||e));
+        }
+      })();
+      break;
+    }
+
+    /* ---------- upload / download real files ---------- */
+    case 'ul': {
+      const input = document.createElement('input');
+      input.type='file';
+      input.onchange = ()=>{
+        const f = input.files[0];
+        if(!f){ return; }
+        const target = resolvePath(rest[0]||f.name);
+        writeFileNode(target, f, true);
+        term.echo(`Uploaded '${f.name}' -> ${pathStr(target)} (${f.size} bytes)`);
+      };
+      input.click();
+      break;
+    }
+    case 'dl': {
+      if(!rest[0]){ term.echo('usage: dl <file|dir>'); break; }
+      const target = resolvePath(rest[0]);
+      const node = getNode(target);
+      if(!node){ term.echo(`dl: cannot access '${rest[0]}': No such file or directory`); break; }
+      let blob, filename;
+      if(node.type==='d'){
+        blob = new Blob([]);
+        filename = 'untitled';
+        term.echo(`dl: '${rest[0]}' is a directory — writing empty archive placeholder`);
+      } else {
+        blob = BLOB_STORE[pathStr(target)] || new Blob([node.data||'']);
+        filename = target[target.length-1];
+      }
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      term.echo(`Downloaded ${filename} (${blob.size} bytes)`);
+      break;
+    }
+
+    default:
+      term.echo(`bash: ${cmd}: command not found`);
+  }
+}
+
+/* small mock REPL for python2/2.7 (no real 2.x runtime exists in-browser) */
+function enterPyMockRepl(term){
+  term.push(function(line){
+    if(line.trim()==='exit()' || line.trim()==='quit()'){ this.pop(); return; }
+    try{
+      // eslint-disable-next-line no-new-func
+      const val = Function('"use strict"; return ('+line+')')();
+      if(val!==undefined) term.echo(String(val));
+    }catch(e){ term.echo('  File "<stdin>", line 1\nSyntaxError: invalid syntax'); }
+  }, { prompt:'[[;#ff5fff;]>>> ]', name:'python2-repl' });
+}
+
+/* ============================================================
+   simple full-screen nano-like editor overlay
+   ============================================================ */
+function openEditor(filename, content, onSave){
+  const overlay = document.createElement('div');
+  overlay.style.cssText='position:fixed;inset:0;background:#0c0c0c;color:#fff;z-index:99999;font-family:monospace;display:flex;flex-direction:column;';
+  overlay.innerHTML = `
+    <div style="background:#333;padding:4px 8px;">GNU nano — ${filename}</div>
+    <textarea style="flex:1;background:#0c0c0c;color:#fff;border:none;outline:none;font-family:monospace;font-size:14px;padding:8px;"></textarea>
+    <div style="background:#333;padding:4px 8px;">^O Write Out    ^X Exit</div>
+  `;
+  const ta = overlay.querySelector('textarea');
+  ta.value = content;
+  document.body.appendChild(overlay);
+  ta.focus();
+  ta.addEventListener('keydown', (e)=>{
+    if(e.ctrlKey && e.key.toLowerCase()==='o'){ e.preventDefault(); onSave(ta.value); }
+    if(e.ctrlKey && e.key.toLowerCase()==='x'){ e.preventDefault(); onSave(ta.value); document.body.removeChild(overlay); }
+  });
+}
+
+/* ============================================================
+   BOOT
+   ============================================================ */
+term = $('#term').terminal(function(cmdline){
+  try{ handleCommand(cmdline, this); }
+  catch(e){ this.error(String(e)); }
+}, {
+  greetings: false,
+  checkArity:false,
+  completion:true,
+  prompt: promptString,
+  onInit: function(){
+    this.echo(`[[;#87d787;]${unameOut(true)}]`);
+    this.echo('');
+  }
+});
+
+document.getElementById('opt-color').onclick = ()=>{
+  document.body.classList.toggle('bw');
+  document.getElementById('opt-color').textContent =
+    'Color scheme: ' + (document.body.classList.contains('bw') ? 'B&W' : 'Color');
+};
+document.getElementById('opt-clear').onclick = ()=> term.clear();
+document.getElementById('opt-reset').onclick = ()=>{
+  if(confirm('Reset virtual filesystem to defaults? This clears all files you created.')){
+    localStorage.removeItem(FS_KEY);
+    location.reload();
+  }
+};
+
+})();
+</script>
+</body>
+</html>
